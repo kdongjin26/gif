@@ -77,7 +77,7 @@
 </head>
 <body>
 <header>
-  <h1>이미지 → GIF 변환기</h1>
+  <h1>이미지 → 애니메이션 이미지 변환기</h1>
   <button id="btn-load">이미지 불러오기</button>
   <button id="btn-clear">전체 삭제</button>
   <div class="sep"></div>
@@ -148,6 +148,13 @@
         <input type="color" id="bg-color" value="#000000">
       </label>
       <label><input type="checkbox" id="bg-transparent"> 투명</label>
+      <div class="sep"></div>
+      <label>출력 포맷:
+        <select id="format">
+          <option value="apng" selected>APNG (.png, 무손실 풀컬러) 권장</option>
+          <option value="gif">GIF (.gif, 256색 제한)</option>
+        </select>
+      </label>
     </div>
   </div>
 </main>
@@ -157,6 +164,8 @@
 <input type="file" id="file-input" accept="image/png,image/jpeg,image/jpg,image/bmp,image/webp,image/gif" multiple style="display:none;">
 
 <script src="https://cdn.jsdelivr.net/npm/gif.js.optimized@1.0.1/dist/gif.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/upng-js@2.1.0/UPNG.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
 const frames = []; // { id, name, lastModified, img, width, height, duration }
@@ -364,12 +373,74 @@ function stopPreview() {
   setStatus('준비됨');
 }
 
-// default save name: <last_original_name_without_ext>_gif.gif
+function currentFormat() { return $('format').value; }
+function formatExt(fmt) { return fmt === 'gif' ? '.gif' : '.png'; }
+function formatSuffix(fmt) { return fmt === 'gif' ? '_gif' : '_apng'; }
+
+// default save name: <last_original_name_without_ext><suffix><ext>
 function defaultSaveName() {
-  if (!frames.length) return 'output.gif';
+  const fmt = currentFormat();
+  if (!frames.length) return `output${formatExt(fmt)}`;
   const last = frames[frames.length - 1].name;
   const base = last.replace(/\.[^.]+$/, '');
-  return `${base}_gif.gif`;
+  return `${base}${formatSuffix(fmt)}${formatExt(fmt)}`;
+}
+
+function getLoopCount() {
+  const mode = $('loop-mode').value;
+  if (mode === 'custom') return Math.max(1, Number($('loop-custom').value) || 1);
+  return Number(mode); // 0 = infinite
+}
+
+// CRC32 for PNG chunk
+function crc32(bytes, start, end) {
+  let c = 0xFFFFFFFF;
+  for (let i = start; i < end; i++) {
+    c ^= bytes[i];
+    for (let j = 0; j < 8; j++) c = (c >>> 1) ^ (0xEDB88320 & -(c & 1));
+  }
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// Patch APNG acTL chunk num_plays (0 = infinite)
+function patchApngLoop(buffer, numPlays) {
+  const bytes = new Uint8Array(buffer);
+  for (let i = 8; i < bytes.length - 12; i++) {
+    if (bytes[i] === 0x61 && bytes[i+1] === 0x63 && bytes[i+2] === 0x54 && bytes[i+3] === 0x4C) {
+      // type 'acTL' at i..i+3; data at i+4..i+11 (num_frames, num_plays); CRC at i+12..i+15
+      const dv = new DataView(bytes.buffer, bytes.byteOffset + i + 8, 4);
+      dv.setUint32(0, numPlays >>> 0, false);
+      const crc = crc32(bytes, i, i + 12);
+      const dv2 = new DataView(bytes.buffer, bytes.byteOffset + i + 12, 4);
+      dv2.setUint32(0, crc, false);
+      return bytes;
+    }
+  }
+  return bytes;
+}
+
+async function buildApng() {
+  if (!frames.length) { setStatus('프레임이 없습니다', 'error'); return null; }
+  const { w, h } = getCanvasSize();
+  setStatus('APNG 생성 중...');
+  await new Promise(r => setTimeout(r, 0)); // allow UI update
+  const tmp = document.createElement('canvas');
+  tmp.width = w; tmp.height = h;
+  const tctx = tmp.getContext('2d');
+  const buffers = [];
+  const delays = [];
+  for (const f of frames) {
+    drawFrameTo(tctx, f, w, h);
+    const data = tctx.getImageData(0, 0, w, h).data;
+    buffers.push(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+    delays.push(f.duration);
+  }
+  // cnum=0 → lossless full 24-bit RGBA
+  const apngBuffer = UPNG.encode(buffers, w, h, 0, delays);
+  const loop = getLoopCount(); // 0 = infinite
+  const patched = patchApngLoop(apngBuffer, loop);
+  setStatus('완료');
+  return new Blob([patched], { type: 'image/png' });
 }
 
 async function buildGif() {
@@ -422,17 +493,24 @@ function downloadBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+async function buildByFormat() {
+  return currentFormat() === 'gif' ? buildGif() : buildApng();
+}
+
 async function saveDefault() {
-  const blob = await buildGif();
+  const blob = await buildByFormat();
   if (blob) downloadBlob(blob, defaultSaveName());
 }
 
 async function saveAs() {
   if (!frames.length) { setStatus('프레임이 없습니다', 'error'); return; }
-  const name = prompt('파일명 입력 (.gif 확장자 자동 추가)', defaultSaveName().replace(/\.gif$/, ''));
+  const fmt = currentFormat();
+  const ext = formatExt(fmt);
+  const defName = defaultSaveName().replace(new RegExp(`\\${ext}$`), '');
+  const name = prompt(`파일명 입력 (${ext} 확장자 자동 추가)`, defName);
   if (name === null) return;
-  const finalName = name.endsWith('.gif') ? name : `${name}.gif`;
-  const blob = await buildGif();
+  const finalName = name.toLowerCase().endsWith(ext) ? name : `${name}${ext}`;
+  const blob = await buildByFormat();
   if (blob) downloadBlob(blob, finalName);
 }
 
