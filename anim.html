@@ -73,6 +73,35 @@
   #status.error { background: #a1260d; color: white; }
   .progress { display: inline-block; margin-left: 10px; }
   .sep { width: 1px; height: 20px; background: #454545; }
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 100;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .modal-backdrop[hidden] { display: none; }
+  .modal {
+    background: #252526; border: 1px solid #444; border-radius: 6px;
+    padding: 14px; display: flex; flex-direction: column; gap: 10px;
+    max-width: 95vw; max-height: 90vh;
+  }
+  .modal-header { display: flex; gap: 8px; align-items: center; }
+  .modal-header .title { font-size: 13px; color: #9cdcfe; margin-right: auto; }
+  #crop-strip-wrap {
+    position: relative; height: 320px; overflow-x: auto; overflow-y: hidden;
+    background: #1a1a1a; border: 1px solid #333; user-select: none;
+  }
+  #crop-strip { position: relative; display: flex; height: 100%; min-width: 100%; }
+  #crop-strip img { height: 100%; width: auto; display: block; pointer-events: none; }
+  .crop-mask { position: absolute; left: 0; right: 0; background: rgba(0,0,0,0.55); pointer-events: none; z-index: 2; }
+  .crop-line {
+    position: absolute; left: 0; right: 0; height: 2px; background: #0e639c;
+    cursor: ns-resize; z-index: 3;
+  }
+  .crop-line::after {
+    content: ''; position: absolute; left: 50%; top: -7px;
+    width: 16px; height: 16px; background: #0e639c;
+    border: 2px solid #fff; border-radius: 50%; transform: translateX(-50%);
+  }
+  #crop-readout { font-size: 12px; color: #ccc; }
 </style>
 </head>
 <body>
@@ -90,6 +119,8 @@
     </select>
   </label>
   <button id="btn-sort">정렬 적용</button>
+  <div class="sep"></div>
+  <button id="btn-bulk-crop">일괄 자르기 (위/아래)</button>
   <div class="spacer"></div>
   <button id="btn-preview">▶ 미리보기</button>
   <button id="btn-stop">■ 정지</button>
@@ -120,7 +151,7 @@
     </div>
     <div id="settings-panel">
       <label>전체 프레임 시간:
-        <input type="number" id="global-duration" value="100" min="10" step="10">ms
+        <input type="number" id="global-duration" value="400" min="10" step="10">ms
       </label>
       <button id="btn-apply-duration">일괄 적용</button>
       <div class="sep"></div>
@@ -151,13 +182,33 @@
       <div class="sep"></div>
       <label>출력 포맷:
         <select id="format">
-          <option value="apng" selected>APNG (.png, 무손실 풀컬러)</option>
-          <option value="webp">WebP (.webp, 고품질 + 작은 용량)</option>
+          <option value="webp" selected>WebP (.webp, 고품질 + 작은 용량)</option>
+          <option value="apng">APNG (.png, 무손실 풀컬러)</option>
         </select>
       </label>
     </div>
   </div>
 </main>
+
+<div id="crop-modal" class="modal-backdrop" hidden>
+  <div class="modal">
+    <div class="modal-header">
+      <span class="title">일괄 위/아래 자르기 — 파란 선을 드래그해 남길 영역 지정</span>
+      <button id="btn-crop-reset">초기화</button>
+      <button id="btn-crop-cancel">취소</button>
+      <button id="btn-crop-apply" class="primary">적용</button>
+    </div>
+    <div id="crop-strip-wrap">
+      <div id="crop-strip">
+        <div class="crop-mask" id="crop-mask-top"></div>
+        <div class="crop-mask" id="crop-mask-bot"></div>
+        <div class="crop-line" id="crop-line-top"></div>
+        <div class="crop-line" id="crop-line-bot"></div>
+      </div>
+    </div>
+    <div id="crop-readout">유지: 0% ~ 100% (높이 100%)</div>
+  </div>
+</div>
 
 <div id="status" class="idle">준비됨</div>
 
@@ -171,6 +222,8 @@ const frames = []; // { id, name, lastModified, img, width, height, duration }
 let nextId = 1;
 let selectedId = null;
 let playTimer = null;
+let cropTop = 0;    // 0..1 (fraction of frame height cut from top)
+let cropBottom = 1; // 0..1 (fraction from top where crop ends; kept range is cropTop..cropBottom)
 
 const statusEl = $('status');
 function setStatus(msg, type = 'idle') {
@@ -204,7 +257,7 @@ async function addFiles(fileList) {
       console.error('로딩 실패:', file.name, e);
     }
   }
-  renderList();
+  applySort();
   drawPreviewFrame(frames.length - 1);
   setStatus(`프레임 ${frames.length}개`);
 }
@@ -312,13 +365,21 @@ function replaceFrame(index) {
   input.click();
 }
 
+function effectiveH(f) {
+  return Math.max(1, Math.round(f.height * (cropBottom - cropTop)));
+}
+
 function getCanvasSize() {
   if (!frames.length) return { w: 400, h: 300 };
   if ($('size-mode').value === 'first') {
-    return { w: frames[0].width, h: frames[0].height };
+    return { w: frames[0].width, h: effectiveH(frames[0]) };
   }
   let w = 0, h = 0;
-  for (const f of frames) { if (f.width > w) w = f.width; if (f.height > h) h = f.height; }
+  for (const f of frames) {
+    if (f.width > w) w = f.width;
+    const eh = effectiveH(f);
+    if (eh > h) h = eh;
+  }
   return { w, h };
 }
 
@@ -330,9 +391,11 @@ function drawFrameTo(ctx, frame, w, h) {
   } else {
     ctx.clearRect(0, 0, w, h);
   }
+  const srcY = Math.round(frame.height * cropTop);
+  const srcH = Math.max(1, Math.round(frame.height * (cropBottom - cropTop)));
   const x = Math.floor((w - frame.width) / 2);
-  const y = Math.floor((h - frame.height) / 2);
-  ctx.drawImage(frame.img, x, y);
+  const y = Math.floor((h - srcH) / 2);
+  ctx.drawImage(frame.img, 0, srcY, frame.width, srcH, x, y, frame.width, srcH);
 }
 
 function drawPreviewFrame(index) {
@@ -598,6 +661,87 @@ function applySort() {
   });
   renderList();
 }
+
+// --- Bulk top/bottom crop modal ---
+const STRIP_H = 320;
+let cropSavedTop = 0, cropSavedBot = 1;
+
+function openCropModal() {
+  if (!frames.length) { setStatus('프레임이 없습니다', 'error'); return; }
+  cropSavedTop = cropTop;
+  cropSavedBot = cropBottom;
+  const strip = $('crop-strip');
+  // remove any previous <img>s, keep mask/line elements
+  strip.querySelectorAll('img').forEach(el => el.remove());
+  // insert images before the mask/line elements
+  const firstOverlay = strip.querySelector('.crop-mask');
+  for (const f of frames) {
+    const img = document.createElement('img');
+    img.src = f.img.src;
+    strip.insertBefore(img, firstOverlay);
+  }
+  updateCropOverlay();
+  $('crop-modal').hidden = false;
+}
+
+function closeCropModal() { $('crop-modal').hidden = true; }
+
+function updateCropOverlay() {
+  const topPx = cropTop * STRIP_H;
+  const botPx = cropBottom * STRIP_H;
+  $('crop-line-top').style.top = topPx + 'px';
+  $('crop-line-bot').style.top = (botPx - 2) + 'px';
+  $('crop-mask-top').style.top = '0';
+  $('crop-mask-top').style.height = topPx + 'px';
+  $('crop-mask-bot').style.top = botPx + 'px';
+  $('crop-mask-bot').style.height = (STRIP_H - botPx) + 'px';
+  const keepPct = (cropBottom - cropTop) * 100;
+  $('crop-readout').textContent =
+    `유지: ${(cropTop*100).toFixed(1)}% ~ ${(cropBottom*100).toFixed(1)}% (높이 ${keepPct.toFixed(1)}%)`;
+}
+
+function attachCropLineDrag(lineId, isTop) {
+  const line = $(lineId);
+  line.addEventListener('mousedown', (ev) => {
+    ev.preventDefault();
+    const wrap = $('crop-strip-wrap');
+    const onMove = (e) => {
+      const rect = wrap.getBoundingClientRect();
+      const y = e.clientY - rect.top;
+      let r = Math.max(0, Math.min(1, y / STRIP_H));
+      if (isTop) cropTop = Math.min(r, cropBottom - 0.005);
+      else cropBottom = Math.max(r, cropTop + 0.005);
+      updateCropOverlay();
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
+attachCropLineDrag('crop-line-top', true);
+attachCropLineDrag('crop-line-bot', false);
+
+$('btn-bulk-crop').onclick = openCropModal;
+$('btn-crop-cancel').onclick = () => {
+  cropTop = cropSavedTop; cropBottom = cropSavedBot;
+  closeCropModal();
+};
+$('btn-crop-reset').onclick = () => {
+  cropTop = 0; cropBottom = 1;
+  updateCropOverlay();
+};
+$('btn-crop-apply').onclick = () => {
+  closeCropModal();
+  if (frames.length) {
+    const i = frames.findIndex(f => f.id === selectedId);
+    drawPreviewFrame(i >= 0 ? i : 0);
+  }
+  setStatus(`자르기 적용: 상 ${(cropTop*100).toFixed(1)}% / 하 ${((1-cropBottom)*100).toFixed(1)}%`);
+};
 
 // Wiring
 $('btn-load').onclick = () => $('file-input').click();
