@@ -90,7 +90,22 @@
     background: #1a1a1a; border: 1px solid #333; user-select: none;
   }
   #crop-strip { position: relative; display: flex; height: 100%; min-width: 100%; }
-  #crop-strip img { height: 100%; width: auto; display: block; pointer-events: none; }
+  .crop-frame { position: relative; height: 100%; flex-shrink: 0; }
+  .crop-frame img { height: 100%; width: auto; display: block; pointer-events: none; }
+  .vmask-left, .vmask-right {
+    position: absolute; top: 0; bottom: 0; background: rgba(0,0,0,0.55);
+    pointer-events: none; z-index: 2;
+  }
+  .vmask-left { left: 0; } .vmask-right { right: 0; }
+  .vline-left, .vline-right {
+    position: absolute; top: 0; bottom: 0; width: 2px; background: #0e639c;
+    cursor: ew-resize; z-index: 3;
+  }
+  .vline-left::after, .vline-right::after {
+    content: ''; position: absolute; top: 50%; left: -7px;
+    width: 16px; height: 16px; background: #0e639c;
+    border: 2px solid #fff; border-radius: 50%; transform: translateY(-50%);
+  }
   .crop-mask { position: absolute; left: 0; right: 0; background: rgba(0,0,0,0.55); pointer-events: none; z-index: 2; }
   .crop-line {
     position: absolute; left: 0; right: 0; height: 2px; background: #0e639c;
@@ -120,7 +135,7 @@
   </label>
   <button id="btn-sort">정렬 적용</button>
   <div class="sep"></div>
-  <button id="btn-bulk-crop">일괄 자르기 (위/아래)</button>
+  <button id="btn-bulk-crop">일괄 자르기</button>
   <div class="spacer"></div>
   <button id="btn-preview">▶ 미리보기</button>
   <button id="btn-stop">■ 정지</button>
@@ -193,7 +208,7 @@
 <div id="crop-modal" class="modal-backdrop" hidden>
   <div class="modal">
     <div class="modal-header">
-      <span class="title">일괄 위/아래 자르기 — 파란 선을 드래그해 남길 영역 지정</span>
+      <span class="title">일괄 자르기 — 파란 선을 드래그해 남길 영역 지정 (상/하 = 스트립 전체, 좌/우 = 각 이미지)</span>
       <button id="btn-crop-reset">초기화</button>
       <button id="btn-crop-cancel">취소</button>
       <button id="btn-crop-apply" class="primary">적용</button>
@@ -222,8 +237,8 @@ const frames = []; // { id, name, lastModified, img, width, height, duration }
 let nextId = 1;
 let selectedId = null;
 let playTimer = null;
-let cropTop = 0;    // 0..1 (fraction of frame height cut from top)
-let cropBottom = 1; // 0..1 (fraction from top where crop ends; kept range is cropTop..cropBottom)
+let cropTop = 0, cropBottom = 1;    // 0..1, kept range cropTop..cropBottom
+let cropLeft = 0, cropRight = 1;    // 0..1, kept range cropLeft..cropRight
 
 const statusEl = $('status');
 function setStatus(msg, type = 'idle') {
@@ -365,6 +380,9 @@ function replaceFrame(index) {
   input.click();
 }
 
+function effectiveW(f) {
+  return Math.max(1, Math.round(f.width * (cropRight - cropLeft)));
+}
 function effectiveH(f) {
   return Math.max(1, Math.round(f.height * (cropBottom - cropTop)));
 }
@@ -372,12 +390,12 @@ function effectiveH(f) {
 function getCanvasSize() {
   if (!frames.length) return { w: 400, h: 300 };
   if ($('size-mode').value === 'first') {
-    return { w: frames[0].width, h: effectiveH(frames[0]) };
+    return { w: effectiveW(frames[0]), h: effectiveH(frames[0]) };
   }
   let w = 0, h = 0;
   for (const f of frames) {
-    if (f.width > w) w = f.width;
-    const eh = effectiveH(f);
+    const ew = effectiveW(f), eh = effectiveH(f);
+    if (ew > w) w = ew;
     if (eh > h) h = eh;
   }
   return { w, h };
@@ -391,11 +409,13 @@ function drawFrameTo(ctx, frame, w, h) {
   } else {
     ctx.clearRect(0, 0, w, h);
   }
+  const srcX = Math.round(frame.width * cropLeft);
   const srcY = Math.round(frame.height * cropTop);
+  const srcW = Math.max(1, Math.round(frame.width * (cropRight - cropLeft)));
   const srcH = Math.max(1, Math.round(frame.height * (cropBottom - cropTop)));
-  const x = Math.floor((w - frame.width) / 2);
+  const x = Math.floor((w - srcW) / 2);
   const y = Math.floor((h - srcH) / 2);
-  ctx.drawImage(frame.img, 0, srcY, frame.width, srcH, x, y, frame.width, srcH);
+  ctx.drawImage(frame.img, srcX, srcY, srcW, srcH, x, y, srcW, srcH);
 }
 
 function drawPreviewFrame(index) {
@@ -662,23 +682,29 @@ function applySort() {
   renderList();
 }
 
-// --- Bulk top/bottom crop modal ---
+// --- Bulk crop modal (top/bottom + per-image left/right) ---
 const STRIP_H = 320;
-let cropSavedTop = 0, cropSavedBot = 1;
+let cropSaved = { top: 0, bottom: 1, left: 0, right: 1 };
 
 function openCropModal() {
   if (!frames.length) { setStatus('프레임이 없습니다', 'error'); return; }
-  cropSavedTop = cropTop;
-  cropSavedBot = cropBottom;
+  cropSaved = { top: cropTop, bottom: cropBottom, left: cropLeft, right: cropRight };
   const strip = $('crop-strip');
-  // remove any previous <img>s, keep mask/line elements
-  strip.querySelectorAll('img').forEach(el => el.remove());
-  // insert images before the mask/line elements
-  const firstOverlay = strip.querySelector('.crop-mask');
+  strip.querySelectorAll('.crop-frame').forEach(el => el.remove());
+  const firstOverlay = strip.querySelector('#crop-mask-top');
   for (const f of frames) {
-    const img = document.createElement('img');
-    img.src = f.img.src;
-    strip.insertBefore(img, firstOverlay);
+    const wrap = document.createElement('div');
+    wrap.className = 'crop-frame';
+    wrap.innerHTML = `
+      <img src="${f.img.src}">
+      <div class="vmask-left"></div>
+      <div class="vmask-right"></div>
+      <div class="vline-left"></div>
+      <div class="vline-right"></div>
+    `;
+    strip.insertBefore(wrap, firstOverlay);
+    attachVLineDrag(wrap.querySelector('.vline-left'), wrap, true);
+    attachVLineDrag(wrap.querySelector('.vline-right'), wrap, false);
   }
   updateCropOverlay();
   $('crop-modal').hidden = false;
@@ -687,6 +713,7 @@ function openCropModal() {
 function closeCropModal() { $('crop-modal').hidden = true; }
 
 function updateCropOverlay() {
+  // strip-wide top/bottom
   const topPx = cropTop * STRIP_H;
   const botPx = cropBottom * STRIP_H;
   $('crop-line-top').style.top = topPx + 'px';
@@ -695,12 +722,23 @@ function updateCropOverlay() {
   $('crop-mask-top').style.height = topPx + 'px';
   $('crop-mask-bot').style.top = botPx + 'px';
   $('crop-mask-bot').style.height = (STRIP_H - botPx) + 'px';
-  const keepPct = (cropBottom - cropTop) * 100;
+  // per-frame left/right
+  const leftPct = cropLeft * 100;
+  const rightPct = cropRight * 100;
+  document.querySelectorAll('#crop-strip .crop-frame').forEach(wrap => {
+    wrap.querySelector('.vmask-left').style.width = leftPct + '%';
+    wrap.querySelector('.vmask-right').style.width = (100 - rightPct) + '%';
+    wrap.querySelector('.vline-left').style.left = `calc(${leftPct}% - 1px)`;
+    wrap.querySelector('.vline-right').style.left = `calc(${rightPct}% - 1px)`;
+  });
+  const keepW = (cropRight - cropLeft) * 100;
+  const keepH = (cropBottom - cropTop) * 100;
   $('crop-readout').textContent =
-    `유지: ${(cropTop*100).toFixed(1)}% ~ ${(cropBottom*100).toFixed(1)}% (높이 ${keepPct.toFixed(1)}%)`;
+    `유지: 가로 ${leftPct.toFixed(1)}%~${rightPct.toFixed(1)}% (${keepW.toFixed(1)}%)  /  ` +
+    `세로 ${(cropTop*100).toFixed(1)}%~${(cropBottom*100).toFixed(1)}% (${keepH.toFixed(1)}%)`;
 }
 
-function attachCropLineDrag(lineId, isTop) {
+function attachHLineDrag(lineId, isTop) {
   const line = $(lineId);
   line.addEventListener('mousedown', (ev) => {
     ev.preventDefault();
@@ -722,16 +760,38 @@ function attachCropLineDrag(lineId, isTop) {
   });
 }
 
-attachCropLineDrag('crop-line-top', true);
-attachCropLineDrag('crop-line-bot', false);
+function attachVLineDrag(lineEl, wrapEl, isLeft) {
+  lineEl.addEventListener('mousedown', (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const onMove = (e) => {
+      const rect = wrapEl.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      let r = Math.max(0, Math.min(1, x / rect.width));
+      if (isLeft) cropLeft = Math.min(r, cropRight - 0.005);
+      else cropRight = Math.max(r, cropLeft + 0.005);
+      updateCropOverlay();
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
+attachHLineDrag('crop-line-top', true);
+attachHLineDrag('crop-line-bot', false);
 
 $('btn-bulk-crop').onclick = openCropModal;
 $('btn-crop-cancel').onclick = () => {
-  cropTop = cropSavedTop; cropBottom = cropSavedBot;
+  cropTop = cropSaved.top; cropBottom = cropSaved.bottom;
+  cropLeft = cropSaved.left; cropRight = cropSaved.right;
   closeCropModal();
 };
 $('btn-crop-reset').onclick = () => {
-  cropTop = 0; cropBottom = 1;
+  cropTop = 0; cropBottom = 1; cropLeft = 0; cropRight = 1;
   updateCropOverlay();
 };
 $('btn-crop-apply').onclick = () => {
@@ -740,7 +800,10 @@ $('btn-crop-apply').onclick = () => {
     const i = frames.findIndex(f => f.id === selectedId);
     drawPreviewFrame(i >= 0 ? i : 0);
   }
-  setStatus(`자르기 적용: 상 ${(cropTop*100).toFixed(1)}% / 하 ${((1-cropBottom)*100).toFixed(1)}%`);
+  setStatus(
+    `자르기 적용: 좌 ${(cropLeft*100).toFixed(1)}% / 우 ${((1-cropRight)*100).toFixed(1)}% / ` +
+    `상 ${(cropTop*100).toFixed(1)}% / 하 ${((1-cropBottom)*100).toFixed(1)}%`
+  );
 };
 
 // Wiring
