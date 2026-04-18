@@ -151,8 +151,8 @@
       <div class="sep"></div>
       <label>출력 포맷:
         <select id="format">
-          <option value="apng" selected>APNG (.png, 무손실 풀컬러) 권장</option>
-          <option value="gif">GIF (.gif, 256색 제한)</option>
+          <option value="apng" selected>APNG (.png, 무손실 풀컬러)</option>
+          <option value="webp">WebP (.webp, 고품질 + 작은 용량)</option>
         </select>
       </label>
     </div>
@@ -163,7 +163,6 @@
 
 <input type="file" id="file-input" accept="image/png,image/jpeg,image/jpg,image/bmp,image/webp,image/gif" multiple style="display:none;">
 
-<script src="https://cdn.jsdelivr.net/npm/gif.js.optimized@1.0.1/dist/gif.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/upng-js@2.1.0/UPNG.js"></script>
 <script>
@@ -374,8 +373,8 @@ function stopPreview() {
 }
 
 function currentFormat() { return $('format').value; }
-function formatExt(fmt) { return fmt === 'gif' ? '.gif' : '.png'; }
-function formatSuffix(fmt) { return fmt === 'gif' ? '_gif' : '_apng'; }
+function formatExt(fmt) { return fmt === 'webp' ? '.webp' : '.png'; }
+function formatSuffix(fmt) { return fmt === 'webp' ? '_webp' : '_apng'; }
 
 // default save name: <last_original_name_without_ext><suffix><ext>
 function defaultSaveName() {
@@ -443,43 +442,115 @@ async function buildApng() {
   return new Blob([patched], { type: 'image/png' });
 }
 
-async function buildGif() {
+// --- Animated WebP via RIFF container assembly ---
+// Each frame is encoded by canvas.toBlob('image/webp', 1.0), then VP8/VP8L/ALPH
+// chunks are extracted and wrapped in an animated WebP (VP8X + ANIM + ANMF).
+
+function parseWebPChunks(bytes) {
+  if (bytes.length < 12) return [];
+  const chunks = [];
+  let off = 12; // skip RIFF + size + WEBP
+  while (off + 8 <= bytes.length) {
+    const type = String.fromCharCode(bytes[off], bytes[off+1], bytes[off+2], bytes[off+3]);
+    const size = new DataView(bytes.buffer, bytes.byteOffset + off + 4, 4).getUint32(0, true);
+    const dataStart = off + 8;
+    const dataEnd = dataStart + size;
+    if (dataEnd > bytes.length) break;
+    chunks.push({ type, data: bytes.slice(dataStart, dataEnd) });
+    off = dataEnd + (size & 1);
+  }
+  return chunks;
+}
+
+function writeU24LE(arr, off, v) {
+  arr[off] = v & 0xFF; arr[off+1] = (v >> 8) & 0xFF; arr[off+2] = (v >> 16) & 0xFF;
+}
+
+async function buildWebP() {
   if (!frames.length) { setStatus('프레임이 없습니다', 'error'); return null; }
   const { w, h } = getCanvasSize();
-  const loopMode = $('loop-mode').value;
-  let repeat;
-  if (loopMode === 'custom') {
-    const n = Math.max(1, Number($('loop-custom').value) || 1);
-    repeat = n - 1; // gif.js: 0=infinite, -1=once (no repeat), n=n extra loops
-  } else {
-    const n = Number(loopMode);
-    repeat = n === 0 ? 0 : n - 1;
-  }
+  if (w > 16384 || h > 16384) { setStatus('WebP 최대 크기 16384 초과', 'error'); return null; }
+  const loop = getLoopCount(); // 0 = infinite
   const transparent = $('bg-transparent').checked;
-  return new Promise((resolve, reject) => {
-    const gif = new GIF({
-      workers: 2,
-      quality: 1, // 낮을수록 고품질
-      width: w,
-      height: h,
-      repeat,
-      workerScript: 'https://cdn.jsdelivr.net/npm/gif.js.optimized@1.0.1/dist/gif.worker.js',
-      transparent: transparent ? 0x00000000 : null,
-      background: transparent ? undefined : $('bg-color').value,
-      dither: false,
+
+  const tmp = document.createElement('canvas');
+  tmp.width = w; tmp.height = h;
+  const tctx = tmp.getContext('2d');
+
+  const frameBodies = [];
+  let hasAlpha = false;
+  for (let i = 0; i < frames.length; i++) {
+    setStatus(`WebP 프레임 인코딩 ${i + 1}/${frames.length}...`);
+    await new Promise(r => setTimeout(r, 0));
+    drawFrameTo(tctx, frames[i], w, h);
+    const blob = await new Promise((res, rej) => {
+      tmp.toBlob(b => b ? res(b) : rej(new Error('toBlob 실패 (브라우저 WebP 미지원?)')), 'image/webp', 1.0);
     });
-    const tmp = document.createElement('canvas');
-    tmp.width = w; tmp.height = h;
-    const tctx = tmp.getContext('2d');
-    for (const f of frames) {
-      drawFrameTo(tctx, f, w, h);
-      gif.addFrame(tctx, { copy: true, delay: f.duration });
+    const buf = new Uint8Array(await blob.arrayBuffer());
+    const imgChunks = parseWebPChunks(buf).filter(c => ['VP8 ', 'VP8L', 'ALPH'].includes(c.type));
+    if (!imgChunks.length) throw new Error('WebP 이미지 청크 추출 실패');
+    if (imgChunks.some(c => c.type === 'VP8L' || c.type === 'ALPH')) hasAlpha = hasAlpha || transparent;
+    // reassemble image chunks with headers, padded to even
+    const parts = [];
+    for (const c of imgChunks) {
+      const head = new Uint8Array(8);
+      for (let k = 0; k < 4; k++) head[k] = c.type.charCodeAt(k);
+      new DataView(head.buffer).setUint32(4, c.data.length, true);
+      parts.push(head, c.data);
+      if (c.data.length & 1) parts.push(new Uint8Array(1));
     }
-    gif.on('progress', (p) => setStatus(`GIF 생성 중... ${Math.round(p * 100)}%`));
-    gif.on('finished', (blob) => { setStatus('완료'); resolve(blob); });
-    gif.on('abort', () => reject(new Error('중단됨')));
-    gif.render();
-  });
+    let total = 0; for (const p of parts) total += p.length;
+    const body = new Uint8Array(total);
+    { let o = 0; for (const p of parts) { body.set(p, o); o += p.length; } }
+    frameBodies.push({ bytes: body, duration: frames[i].duration });
+  }
+
+  setStatus('WebP 컨테이너 조립 중...');
+  const wm1 = w - 1, hm1 = h - 1;
+  const parts = [];
+  // VP8X
+  const vp8x = new Uint8Array(8 + 10);
+  vp8x.set([0x56,0x50,0x38,0x58], 0);
+  new DataView(vp8x.buffer).setUint32(4, 10, true);
+  vp8x[8] = 0x02 | (transparent ? 0x10 : 0); // ANIMATION + optional ALPHA
+  writeU24LE(vp8x, 12, wm1);
+  writeU24LE(vp8x, 15, hm1);
+  parts.push(vp8x);
+
+  // ANIM
+  const anim = new Uint8Array(8 + 6);
+  anim.set([0x41,0x4E,0x49,0x4D], 0);
+  new DataView(anim.buffer).setUint32(4, 6, true);
+  // background BGRA zeros (transparent) — irrelevant when frames cover canvas
+  anim[12] = loop & 0xFF; anim[13] = (loop >> 8) & 0xFF;
+  parts.push(anim);
+
+  // ANMF per frame
+  for (const fb of frameBodies) {
+    const dataLen = 16 + fb.bytes.length;
+    const anmf = new Uint8Array(8 + 16);
+    anmf.set([0x41,0x4E,0x4D,0x46], 0);
+    new DataView(anmf.buffer).setUint32(4, dataLen, true);
+    // x=0, y=0 (3 bytes each, already zero)
+    writeU24LE(anmf, 14, wm1);
+    writeU24LE(anmf, 17, hm1);
+    writeU24LE(anmf, 20, Math.min(fb.duration, 0xFFFFFF));
+    anmf[23] = 0; // alpha_blend + no dispose
+    parts.push(anmf, fb.bytes);
+    if (fb.bytes.length & 1) parts.push(new Uint8Array(1));
+  }
+
+  let bodyLen = 4; // 'WEBP'
+  for (const p of parts) bodyLen += p.length;
+  const out = new Uint8Array(8 + bodyLen);
+  out.set([0x52,0x49,0x46,0x46], 0); // RIFF
+  new DataView(out.buffer).setUint32(4, bodyLen, true);
+  out.set([0x57,0x45,0x42,0x50], 8); // WEBP
+  let off = 12;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+
+  setStatus('완료');
+  return new Blob([out], { type: 'image/webp' });
 }
 
 function downloadBlob(blob, filename) {
@@ -494,7 +565,7 @@ function downloadBlob(blob, filename) {
 }
 
 async function buildByFormat() {
-  return currentFormat() === 'gif' ? buildGif() : buildApng();
+  return currentFormat() === 'webp' ? buildWebP() : buildApng();
 }
 
 async function saveDefault() {
