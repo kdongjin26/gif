@@ -668,11 +668,28 @@ async function saveAs() {
   if (blob) downloadBlob(blob, finalName);
 }
 
+function naturalCompare(a, b) {
+  const chunks = s => s.match(/(\d+|\D+)/g) || [];
+  const A = chunks(a), B = chunks(b);
+  const n = Math.min(A.length, B.length);
+  for (let i = 0; i < n; i++) {
+    const x = A[i], y = B[i];
+    if (/^\d/.test(x) && /^\d/.test(y)) {
+      const d = parseInt(x, 10) - parseInt(y, 10);
+      if (d) return d;
+      if (x !== y) return x < y ? -1 : 1;
+    } else if (x !== y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  return A.length - B.length;
+}
+
 function applySort() {
   const mode = $('sort-mode').value;
   frames.sort((a, b) => {
     if (mode.startsWith('name')) {
-      const r = a.name.localeCompare(b.name, 'ko', { numeric: true, sensitivity: 'base' });
+      const r = naturalCompare(a.name, b.name);
       return mode.endsWith('asc') ? r : -r;
     } else {
       const r = a.lastModified - b.lastModified;
