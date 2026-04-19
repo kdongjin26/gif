@@ -40,6 +40,9 @@
     transition: background 0.1s;
   }
   .frame.selected { border-color: #0e639c; background: #094771; }
+  .frame.excluded { opacity: 0.4; }
+  .frame.excluded img { filter: grayscale(100%); }
+  .frame-include { width: 16px; height: 16px; flex-shrink: 0; cursor: pointer; }
   .frame.dragging { opacity: 0.4; }
   .frame.drag-over { border-top: 2px solid #0e639c; }
   .frame img { width: 48px; height: 48px; object-fit: contain; background: #1e1e1e; border-radius: 2px; flex-shrink: 0; }
@@ -148,7 +151,10 @@
   <div id="list-panel">
     <div id="list-header">
       <span id="frame-count">프레임 0개</span>
-      <span style="color:#888;">드래그로 순서 변경</span>
+      <div style="display:flex; gap:4px;">
+        <button id="btn-check-all" style="padding:2px 6px; font-size:11px;">모두 선택</button>
+        <button id="btn-uncheck-all" style="padding:2px 6px; font-size:11px;">모두 해제</button>
+      </div>
     </div>
     <div id="frame-list" class="empty">
       이미지를 추가하세요
@@ -267,6 +273,7 @@ async function addFiles(fileList) {
         width: img.naturalWidth,
         height: img.naturalHeight,
         duration: defaultDuration,
+        included: true,
       });
     } catch (e) {
       console.error('로딩 실패:', file.name, e);
@@ -287,9 +294,12 @@ function loadImage(file) {
   });
 }
 
+function includedFrames() { return frames.filter(f => f.included); }
+
 function renderList() {
   const list = $('frame-list');
-  $('frame-count').textContent = `프레임 ${frames.length}개`;
+  const inc = includedFrames().length;
+  $('frame-count').textContent = `프레임 ${frames.length}개 (선택 ${inc}개)`;
   if (!frames.length) {
     list.className = 'empty';
     list.innerHTML = '이미지를 추가하세요';
@@ -299,10 +309,11 @@ function renderList() {
   list.innerHTML = '';
   frames.forEach((f, i) => {
     const row = document.createElement('div');
-    row.className = 'frame' + (f.id === selectedId ? ' selected' : '');
+    row.className = 'frame' + (f.id === selectedId ? ' selected' : '') + (f.included ? '' : ' excluded');
     row.draggable = true;
     row.dataset.id = f.id;
     row.innerHTML = `
+      <input type="checkbox" class="frame-include" ${f.included ? 'checked' : ''} title="출력 포함">
       <img src="${f.img.src}" alt="">
       <div class="frame-info">
         <div class="frame-name" title="${f.name}">${i + 1}. ${f.name}</div>
@@ -319,6 +330,10 @@ function renderList() {
       selectedId = f.id;
       renderList();
       drawPreviewFrame(i);
+    });
+    row.querySelector('.frame-include').addEventListener('change', (e) => {
+      f.included = e.target.checked;
+      renderList();
     });
     row.querySelector('.frame-duration').addEventListener('change', (e) => {
       f.duration = Math.max(10, Number(e.target.value) || 100);
@@ -388,12 +403,13 @@ function effectiveH(f) {
 }
 
 function getCanvasSize() {
-  if (!frames.length) return { w: 400, h: 300 };
+  const list = includedFrames();
+  if (!list.length) return { w: 400, h: 300 };
   if ($('size-mode').value === 'first') {
-    return { w: effectiveW(frames[0]), h: effectiveH(frames[0]) };
+    return { w: effectiveW(list[0]), h: effectiveH(list[0]) };
   }
   let w = 0, h = 0;
-  for (const f of frames) {
+  for (const f of list) {
     const ew = effectiveW(f), eh = effectiveH(f);
     if (ew > w) w = ew;
     if (eh > h) h = eh;
@@ -437,13 +453,15 @@ function clearPreview() {
 }
 
 function startPreview() {
-  if (!frames.length) return;
+  const list = includedFrames();
+  if (!list.length) { setStatus('선택된 프레임이 없습니다', 'error'); return; }
   stopPreview();
   let i = 0;
   const tick = () => {
-    drawPreviewFrame(i);
-    const d = frames[i].duration;
-    i = (i + 1) % frames.length;
+    const f = list[i];
+    drawPreviewFrame(frames.indexOf(f));
+    const d = f.duration;
+    i = (i + 1) % list.length;
     playTimer = setTimeout(tick, d);
   };
   tick();
@@ -462,8 +480,9 @@ function formatSuffix(fmt) { return fmt === 'webp' ? '_webp' : '_apng'; }
 // default save name: <last_original_name_without_ext><suffix><ext>
 function defaultSaveName() {
   const fmt = currentFormat();
-  if (!frames.length) return `output${formatExt(fmt)}`;
-  const last = frames[frames.length - 1].name;
+  const list = includedFrames();
+  if (!list.length) return `output${formatExt(fmt)}`;
+  const last = list[list.length - 1].name;
   const base = last.replace(/\.[^.]+$/, '');
   return `${base}${formatSuffix(fmt)}${formatExt(fmt)}`;
 }
@@ -502,7 +521,8 @@ function patchApngLoop(buffer, numPlays) {
 }
 
 async function buildApng() {
-  if (!frames.length) { setStatus('프레임이 없습니다', 'error'); return null; }
+  const list = includedFrames();
+  if (!list.length) { setStatus('선택된 프레임이 없습니다', 'error'); return null; }
   const { w, h } = getCanvasSize();
   setStatus('APNG 생성 중...');
   await new Promise(r => setTimeout(r, 0)); // allow UI update
@@ -511,7 +531,7 @@ async function buildApng() {
   const tctx = tmp.getContext('2d');
   const buffers = [];
   const delays = [];
-  for (const f of frames) {
+  for (const f of list) {
     drawFrameTo(tctx, f, w, h);
     const data = tctx.getImageData(0, 0, w, h).data;
     buffers.push(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
@@ -550,7 +570,8 @@ function writeU24LE(arr, off, v) {
 }
 
 async function buildWebP() {
-  if (!frames.length) { setStatus('프레임이 없습니다', 'error'); return null; }
+  const list = includedFrames();
+  if (!list.length) { setStatus('선택된 프레임이 없습니다', 'error'); return null; }
   const { w, h } = getCanvasSize();
   if (w > 16384 || h > 16384) { setStatus('WebP 최대 크기 16384 초과', 'error'); return null; }
   const loop = getLoopCount(); // 0 = infinite
@@ -562,10 +583,10 @@ async function buildWebP() {
 
   const frameBodies = [];
   let hasAlpha = false;
-  for (let i = 0; i < frames.length; i++) {
-    setStatus(`WebP 프레임 인코딩 ${i + 1}/${frames.length}...`);
+  for (let i = 0; i < list.length; i++) {
+    setStatus(`WebP 프레임 인코딩 ${i + 1}/${list.length}...`);
     await new Promise(r => setTimeout(r, 0));
-    drawFrameTo(tctx, frames[i], w, h);
+    drawFrameTo(tctx, list[i], w, h);
     const blob = await new Promise((res, rej) => {
       tmp.toBlob(b => b ? res(b) : rej(new Error('toBlob 실패 (브라우저 WebP 미지원?)')), 'image/webp', 1.0);
     });
@@ -585,7 +606,7 @@ async function buildWebP() {
     let total = 0; for (const p of parts) total += p.length;
     const body = new Uint8Array(total);
     { let o = 0; for (const p of parts) { body.set(p, o); o += p.length; } }
-    frameBodies.push({ bytes: body, duration: frames[i].duration });
+    frameBodies.push({ bytes: body, duration: list[i].duration });
   }
 
   setStatus('WebP 컨테이너 조립 중...');
@@ -704,12 +725,13 @@ const STRIP_H = 320;
 let cropSaved = { top: 0, bottom: 1, left: 0, right: 1 };
 
 function openCropModal() {
-  if (!frames.length) { setStatus('프레임이 없습니다', 'error'); return; }
+  const list = includedFrames();
+  if (!list.length) { setStatus('선택된 프레임이 없습니다', 'error'); return; }
   cropSaved = { top: cropTop, bottom: cropBottom, left: cropLeft, right: cropRight };
   const strip = $('crop-strip');
   strip.querySelectorAll('.crop-frame').forEach(el => el.remove());
   const firstOverlay = strip.querySelector('#crop-mask-top');
-  for (const f of frames) {
+  for (const f of list) {
     const wrap = document.createElement('div');
     wrap.className = 'crop-frame';
     wrap.innerHTML = `
@@ -826,6 +848,16 @@ $('btn-crop-apply').onclick = () => {
 // Wiring
 $('btn-load').onclick = () => $('file-input').click();
 $('file-input').onchange = (e) => { addFiles(e.target.files); e.target.value = ''; };
+$('btn-check-all').onclick = () => {
+  if (!frames.length) return;
+  frames.forEach(f => f.included = true);
+  renderList();
+};
+$('btn-uncheck-all').onclick = () => {
+  if (!frames.length) return;
+  frames.forEach(f => f.included = false);
+  renderList();
+};
 $('btn-clear').onclick = () => {
   if (!frames.length) return;
   if (!confirm('모든 프레임을 삭제할까요?')) return;
