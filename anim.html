@@ -119,6 +119,24 @@
     width: 16px; height: 16px; background: #0e639c;
     border: 2px solid #fff; border-radius: 50%; transform: translateX(-50%);
   }
+  /* Ratio-locked overlay */
+  .lm-top, .lm-bot, .lm-left, .lm-right {
+    position: absolute; background: rgba(0,0,0,0.55); pointer-events: none; z-index: 2;
+  }
+  .lock-box {
+    position: absolute; border: 1px solid #0e639c; box-sizing: border-box;
+    cursor: move; z-index: 3;
+  }
+  .lock-handle {
+    position: absolute; width: 14px; height: 14px;
+    background: #0e639c; border: 2px solid #fff; border-radius: 50%;
+    transform: translate(-50%, -50%); z-index: 4;
+  }
+  .lh-nw, .lh-se { cursor: nwse-resize; }
+  .lh-ne, .lh-sw { cursor: nesw-resize; }
+  /* Mode visibility */
+  #crop-modal-inner[data-mode="locked"] .free-only { display: none !important; }
+  #crop-modal-inner[data-mode="free"] .locked-only { display: none !important; }
   #crop-readout { font-size: 12px; color: #ccc; }
 </style>
 </head>
@@ -212,19 +230,33 @@
 </main>
 
 <div id="crop-modal" class="modal-backdrop" hidden>
-  <div class="modal">
+  <div class="modal" id="crop-modal-inner" data-mode="locked">
     <div class="modal-header">
-      <span class="title">일괄 자르기 — 파란 선을 드래그해 남길 영역 지정 (상/하 = 스트립 전체, 좌/우 = 각 이미지)</span>
+      <span class="title">일괄 자르기 — 비율 선택 후 드래그로 영역 지정</span>
+      <label style="font-size:12px;">비율:
+        <select id="crop-ratio">
+          <option value="free">자유</option>
+          <option value="1:1">1:1</option>
+          <option value="2:3">2:3 (세로)</option>
+          <option value="3:2">3:2 (가로)</option>
+          <option value="9:16" selected>9:16 (세로)</option>
+          <option value="16:9">16:9 (가로)</option>
+          <option value="3:4">3:4 (세로)</option>
+          <option value="4:3">4:3 (가로)</option>
+          <option value="4:5">4:5 (세로)</option>
+          <option value="5:4">5:4 (가로)</option>
+        </select>
+      </label>
       <button id="btn-crop-reset">초기화</button>
       <button id="btn-crop-cancel">취소</button>
       <button id="btn-crop-apply" class="primary">적용</button>
     </div>
     <div id="crop-strip-wrap">
       <div id="crop-strip">
-        <div class="crop-mask" id="crop-mask-top"></div>
-        <div class="crop-mask" id="crop-mask-bot"></div>
-        <div class="crop-line" id="crop-line-top"></div>
-        <div class="crop-line" id="crop-line-bot"></div>
+        <div class="crop-mask free-only" id="crop-mask-top"></div>
+        <div class="crop-mask free-only" id="crop-mask-bot"></div>
+        <div class="crop-line free-only" id="crop-line-top"></div>
+        <div class="crop-line free-only" id="crop-line-bot"></div>
       </div>
     </div>
     <div id="crop-readout">유지: 0% ~ 100% (높이 100%)</div>
@@ -243,8 +275,40 @@ const frames = []; // { id, name, lastModified, img, width, height, duration }
 let nextId = 1;
 let selectedId = null;
 let playTimer = null;
-let cropTop = 0, cropBottom = 1;    // 0..1, kept range cropTop..cropBottom
-let cropLeft = 0, cropRight = 1;    // 0..1, kept range cropLeft..cropRight
+let cropTop = 0, cropBottom = 1;    // 0..1, free mode
+let cropLeft = 0, cropRight = 1;    // 0..1, free mode
+let cropRatio = '9:16';             // 'free' or 'W:H'
+let cropCX = 0.5, cropCY = 0.5;     // locked mode: center as fraction of frame
+let cropScale = 1;                  // locked mode: 0..1 fraction of max ratio box
+
+function ratioValue() {
+  if (cropRatio === 'free') return null;
+  const [w, h] = cropRatio.split(':').map(Number);
+  return w / h;
+}
+
+function getCropRect(frame) {
+  const r = ratioValue();
+  if (r == null) {
+    return {
+      x: Math.round(frame.width * cropLeft),
+      y: Math.round(frame.height * cropTop),
+      w: Math.max(1, Math.round(frame.width * (cropRight - cropLeft))),
+      h: Math.max(1, Math.round(frame.height * (cropBottom - cropTop))),
+    };
+  }
+  const fw = frame.width, fh = frame.height;
+  const maxW = Math.min(fw, fh * r);
+  const maxH = maxW / r;
+  const s = Math.max(0.02, Math.min(1, cropScale));
+  let w = Math.max(1, Math.round(maxW * s));
+  let h = Math.max(1, Math.round(maxH * s));
+  let x = Math.round(cropCX * fw - w / 2);
+  let y = Math.round(cropCY * fh - h / 2);
+  x = Math.max(0, Math.min(fw - w, x));
+  y = Math.max(0, Math.min(fh - h, y));
+  return { x, y, w, h };
+}
 
 const statusEl = $('status');
 function setStatus(msg, type = 'idle') {
@@ -395,24 +459,18 @@ function replaceFrame(index) {
   input.click();
 }
 
-function effectiveW(f) {
-  return Math.max(1, Math.round(f.width * (cropRight - cropLeft)));
-}
-function effectiveH(f) {
-  return Math.max(1, Math.round(f.height * (cropBottom - cropTop)));
-}
-
 function getCanvasSize() {
   const list = includedFrames();
   if (!list.length) return { w: 400, h: 300 };
   if ($('size-mode').value === 'first') {
-    return { w: effectiveW(list[0]), h: effectiveH(list[0]) };
+    const r = getCropRect(list[0]);
+    return { w: r.w, h: r.h };
   }
   let w = 0, h = 0;
   for (const f of list) {
-    const ew = effectiveW(f), eh = effectiveH(f);
-    if (ew > w) w = ew;
-    if (eh > h) h = eh;
+    const r = getCropRect(f);
+    if (r.w > w) w = r.w;
+    if (r.h > h) h = r.h;
   }
   return { w, h };
 }
@@ -425,13 +483,19 @@ function drawFrameTo(ctx, frame, w, h) {
   } else {
     ctx.clearRect(0, 0, w, h);
   }
-  const srcX = Math.round(frame.width * cropLeft);
-  const srcY = Math.round(frame.height * cropTop);
-  const srcW = Math.max(1, Math.round(frame.width * (cropRight - cropLeft)));
-  const srcH = Math.max(1, Math.round(frame.height * (cropBottom - cropTop)));
-  const x = Math.floor((w - srcW) / 2);
-  const y = Math.floor((h - srcH) / 2);
-  ctx.drawImage(frame.img, srcX, srcY, srcW, srcH, x, y, srcW, srcH);
+  const r = getCropRect(frame);
+  if (cropRatio !== 'free') {
+    const scale = Math.min(w / r.w, h / r.h);
+    const dw = Math.round(r.w * scale);
+    const dh = Math.round(r.h * scale);
+    const dx = Math.floor((w - dw) / 2);
+    const dy = Math.floor((h - dh) / 2);
+    ctx.drawImage(frame.img, r.x, r.y, r.w, r.h, dx, dy, dw, dh);
+  } else {
+    const dx = Math.floor((w - r.w) / 2);
+    const dy = Math.floor((h - r.h) / 2);
+    ctx.drawImage(frame.img, r.x, r.y, r.w, r.h, dx, dy, r.w, r.h);
+  }
 }
 
 function drawPreviewFrame(index) {
@@ -720,31 +784,51 @@ function applySort() {
   renderList();
 }
 
-// --- Bulk crop modal (top/bottom + per-image left/right) ---
+// --- Bulk crop modal ---
 const STRIP_H = 320;
-let cropSaved = { top: 0, bottom: 1, left: 0, right: 1 };
+let cropSaved = { top: 0, bottom: 1, left: 0, right: 1, ratio: '9:16', cx: 0.5, cy: 0.5, scale: 1 };
 
 function openCropModal() {
   const list = includedFrames();
   if (!list.length) { setStatus('선택된 프레임이 없습니다', 'error'); return; }
-  cropSaved = { top: cropTop, bottom: cropBottom, left: cropLeft, right: cropRight };
+  cropSaved = {
+    top: cropTop, bottom: cropBottom, left: cropLeft, right: cropRight,
+    ratio: cropRatio, cx: cropCX, cy: cropCY, scale: cropScale,
+  };
   const strip = $('crop-strip');
   strip.querySelectorAll('.crop-frame').forEach(el => el.remove());
   const firstOverlay = strip.querySelector('#crop-mask-top');
   for (const f of list) {
     const wrap = document.createElement('div');
     wrap.className = 'crop-frame';
+    wrap._frame = f;
     wrap.innerHTML = `
       <img src="${f.img.src}">
-      <div class="vmask-left"></div>
-      <div class="vmask-right"></div>
-      <div class="vline-left"></div>
-      <div class="vline-right"></div>
+      <div class="vmask-left free-only"></div>
+      <div class="vmask-right free-only"></div>
+      <div class="vline-left free-only"></div>
+      <div class="vline-right free-only"></div>
+      <div class="lm-top locked-only"></div>
+      <div class="lm-bot locked-only"></div>
+      <div class="lm-left locked-only"></div>
+      <div class="lm-right locked-only"></div>
+      <div class="lock-box locked-only"></div>
+      <div class="lock-handle lh-nw locked-only"></div>
+      <div class="lock-handle lh-ne locked-only"></div>
+      <div class="lock-handle lh-sw locked-only"></div>
+      <div class="lock-handle lh-se locked-only"></div>
     `;
     strip.insertBefore(wrap, firstOverlay);
     attachVLineDrag(wrap.querySelector('.vline-left'), wrap, true);
     attachVLineDrag(wrap.querySelector('.vline-right'), wrap, false);
+    attachLockBoxDrag(wrap.querySelector('.lock-box'), wrap);
+    attachLockHandleDrag(wrap.querySelector('.lh-nw'), wrap, 'nw');
+    attachLockHandleDrag(wrap.querySelector('.lh-ne'), wrap, 'ne');
+    attachLockHandleDrag(wrap.querySelector('.lh-sw'), wrap, 'sw');
+    attachLockHandleDrag(wrap.querySelector('.lh-se'), wrap, 'se');
   }
+  $('crop-ratio').value = cropRatio;
+  $('crop-modal-inner').dataset.mode = (cropRatio === 'free') ? 'free' : 'locked';
   updateCropOverlay();
   $('crop-modal').hidden = false;
 }
@@ -752,29 +836,61 @@ function openCropModal() {
 function closeCropModal() { $('crop-modal').hidden = true; }
 
 function updateCropOverlay() {
-  // strip-wide top/bottom
-  const topPx = cropTop * STRIP_H;
-  const botPx = cropBottom * STRIP_H;
-  $('crop-line-top').style.top = topPx + 'px';
-  $('crop-line-bot').style.top = (botPx - 2) + 'px';
-  $('crop-mask-top').style.top = '0';
-  $('crop-mask-top').style.height = topPx + 'px';
-  $('crop-mask-bot').style.top = botPx + 'px';
-  $('crop-mask-bot').style.height = (STRIP_H - botPx) + 'px';
-  // per-frame left/right
-  const leftPct = cropLeft * 100;
-  const rightPct = cropRight * 100;
+  const mode = $('crop-modal-inner').dataset.mode;
+  if (mode === 'free') {
+    const topPx = cropTop * STRIP_H;
+    const botPx = cropBottom * STRIP_H;
+    $('crop-line-top').style.top = topPx + 'px';
+    $('crop-line-bot').style.top = (botPx - 2) + 'px';
+    $('crop-mask-top').style.top = '0';
+    $('crop-mask-top').style.height = topPx + 'px';
+    $('crop-mask-bot').style.top = botPx + 'px';
+    $('crop-mask-bot').style.height = (STRIP_H - botPx) + 'px';
+    const leftPct = cropLeft * 100, rightPct = cropRight * 100;
+    document.querySelectorAll('#crop-strip .crop-frame').forEach(wrap => {
+      wrap.querySelector('.vmask-left').style.width = leftPct + '%';
+      wrap.querySelector('.vmask-right').style.width = (100 - rightPct) + '%';
+      wrap.querySelector('.vline-left').style.left = `calc(${leftPct}% - 1px)`;
+      wrap.querySelector('.vline-right').style.left = `calc(${rightPct}% - 1px)`;
+    });
+    const keepW = (cropRight - cropLeft) * 100, keepH = (cropBottom - cropTop) * 100;
+    $('crop-readout').textContent =
+      `자유: 가로 ${leftPct.toFixed(1)}%~${rightPct.toFixed(1)}% (${keepW.toFixed(1)}%)  /  ` +
+      `세로 ${(cropTop*100).toFixed(1)}%~${(cropBottom*100).toFixed(1)}% (${keepH.toFixed(1)}%)`;
+    return;
+  }
+  // locked mode — per-frame rect
   document.querySelectorAll('#crop-strip .crop-frame').forEach(wrap => {
-    wrap.querySelector('.vmask-left').style.width = leftPct + '%';
-    wrap.querySelector('.vmask-right').style.width = (100 - rightPct) + '%';
-    wrap.querySelector('.vline-left').style.left = `calc(${leftPct}% - 1px)`;
-    wrap.querySelector('.vline-right').style.left = `calc(${rightPct}% - 1px)`;
+    const f = wrap._frame;
+    const r = getCropRect(f);
+    const dispW = wrap.offsetWidth, dispH = wrap.offsetHeight || STRIP_H;
+    const sx = dispW / f.width, sy = dispH / f.height;
+    const dx = r.x * sx, dy = r.y * sy;
+    const dw = r.w * sx, dh = r.h * sy;
+    const lm_t = wrap.querySelector('.lm-top');
+    const lm_b = wrap.querySelector('.lm-bot');
+    const lm_l = wrap.querySelector('.lm-left');
+    const lm_r = wrap.querySelector('.lm-right');
+    lm_t.style.left = '0'; lm_t.style.top = '0'; lm_t.style.width = dispW + 'px'; lm_t.style.height = dy + 'px';
+    lm_b.style.left = '0'; lm_b.style.top = (dy + dh) + 'px'; lm_b.style.width = dispW + 'px'; lm_b.style.height = (dispH - dy - dh) + 'px';
+    lm_l.style.left = '0'; lm_l.style.top = dy + 'px'; lm_l.style.width = dx + 'px'; lm_l.style.height = dh + 'px';
+    lm_r.style.left = (dx + dw) + 'px'; lm_r.style.top = dy + 'px'; lm_r.style.width = (dispW - dx - dw) + 'px'; lm_r.style.height = dh + 'px';
+    const box = wrap.querySelector('.lock-box');
+    box.style.left = dx + 'px'; box.style.top = dy + 'px';
+    box.style.width = dw + 'px'; box.style.height = dh + 'px';
+    const H = { nw: [dx, dy], ne: [dx + dw, dy], sw: [dx, dy + dh], se: [dx + dw, dy + dh] };
+    for (const k of Object.keys(H)) {
+      const h = wrap.querySelector('.lh-' + k);
+      h.style.left = H[k][0] + 'px'; h.style.top = H[k][1] + 'px';
+    }
   });
-  const keepW = (cropRight - cropLeft) * 100;
-  const keepH = (cropBottom - cropTop) * 100;
-  $('crop-readout').textContent =
-    `유지: 가로 ${leftPct.toFixed(1)}%~${rightPct.toFixed(1)}% (${keepW.toFixed(1)}%)  /  ` +
-    `세로 ${(cropTop*100).toFixed(1)}%~${(cropBottom*100).toFixed(1)}% (${keepH.toFixed(1)}%)`;
+  const first = includedFrames()[0];
+  if (first) {
+    const r = getCropRect(first);
+    $('crop-readout').textContent =
+      `비율 ${cropRatio} 고정 · 스케일 ${(cropScale*100).toFixed(0)}% · 중앙 (${(cropCX*100).toFixed(0)}%, ${(cropCY*100).toFixed(0)}%) · ` +
+      `첫 프레임 출력: ${r.w}×${r.h}px`;
+  }
 }
 
 function attachHLineDrag(lineId, isTop) {
@@ -820,17 +936,98 @@ function attachVLineDrag(lineEl, wrapEl, isLeft) {
   });
 }
 
+function attachLockBoxDrag(boxEl, wrapEl) {
+  boxEl.addEventListener('mousedown', (ev) => {
+    if (ev.target !== boxEl) return; // let handles receive their own events
+    ev.preventDefault();
+    ev.stopPropagation();
+    const startX = ev.clientX, startY = ev.clientY;
+    const startCX = cropCX, startCY = cropCY;
+    const f = wrapEl._frame;
+    const dispW = wrapEl.offsetWidth, dispH = wrapEl.offsetHeight || STRIP_H;
+    const onMove = (e) => {
+      const dxDisp = e.clientX - startX;
+      const dyDisp = e.clientY - startY;
+      const dxFrac = dxDisp / dispW;
+      const dyFrac = dyDisp / dispH;
+      cropCX = Math.max(0, Math.min(1, startCX + dxFrac));
+      cropCY = Math.max(0, Math.min(1, startCY + dyFrac));
+      updateCropOverlay();
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
+function attachLockHandleDrag(handleEl, wrapEl, corner) {
+  handleEl.addEventListener('mousedown', (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const f = wrapEl._frame;
+    const startX = ev.clientX, startY = ev.clientY;
+    const startScale = cropScale;
+    const r = ratioValue();
+    if (r == null) return;
+    const maxW = Math.min(f.width, f.height * r);
+    const dispW = wrapEl.offsetWidth, dispH = wrapEl.offsetHeight || STRIP_H;
+    // We interpret handle drag as scale change along the diagonal direction.
+    // Outward = larger scale, inward = smaller.
+    const signX = corner.includes('e') ? 1 : -1;
+    const signY = corner.includes('s') ? 1 : -1;
+    const onMove = (e) => {
+      const dxDisp = (e.clientX - startX) * signX;
+      const dyDisp = (e.clientY - startY) * signY;
+      // convert to frame pixels
+      const dxF = dxDisp * (f.width / dispW);
+      const dyF = dyDisp * (f.height / dispH);
+      // combine (use max of both for intuitive corner drag)
+      const deltaW = Math.max(dxF, dyF * r);
+      const newW = Math.max(8, Math.min(maxW, startScale * maxW + deltaW));
+      cropScale = newW / maxW;
+      updateCropOverlay();
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
 attachHLineDrag('crop-line-top', true);
 attachHLineDrag('crop-line-bot', false);
 
 $('btn-bulk-crop').onclick = openCropModal;
+
+$('crop-ratio').onchange = (e) => {
+  cropRatio = e.target.value;
+  $('crop-modal-inner').dataset.mode = (cropRatio === 'free') ? 'free' : 'locked';
+  // reasonable defaults when entering locked mode
+  if (cropRatio !== 'free') {
+    if (cropScale <= 0 || cropScale > 1) cropScale = 1;
+    if (cropCX <= 0 || cropCX >= 1) cropCX = 0.5;
+    if (cropCY <= 0 || cropCY >= 1) cropCY = 0.5;
+  }
+  updateCropOverlay();
+};
+
 $('btn-crop-cancel').onclick = () => {
   cropTop = cropSaved.top; cropBottom = cropSaved.bottom;
   cropLeft = cropSaved.left; cropRight = cropSaved.right;
+  cropRatio = cropSaved.ratio; cropCX = cropSaved.cx; cropCY = cropSaved.cy; cropScale = cropSaved.scale;
   closeCropModal();
 };
 $('btn-crop-reset').onclick = () => {
-  cropTop = 0; cropBottom = 1; cropLeft = 0; cropRight = 1;
+  if (cropRatio === 'free') {
+    cropTop = 0; cropBottom = 1; cropLeft = 0; cropRight = 1;
+  } else {
+    cropCX = 0.5; cropCY = 0.5; cropScale = 1;
+  }
   updateCropOverlay();
 };
 $('btn-crop-apply').onclick = () => {
@@ -839,10 +1036,14 @@ $('btn-crop-apply').onclick = () => {
     const i = frames.findIndex(f => f.id === selectedId);
     drawPreviewFrame(i >= 0 ? i : 0);
   }
-  setStatus(
-    `자르기 적용: 좌 ${(cropLeft*100).toFixed(1)}% / 우 ${((1-cropRight)*100).toFixed(1)}% / ` +
-    `상 ${(cropTop*100).toFixed(1)}% / 하 ${((1-cropBottom)*100).toFixed(1)}%`
-  );
+  if (cropRatio === 'free') {
+    setStatus(
+      `자르기 적용(자유): 좌 ${(cropLeft*100).toFixed(1)}% / 우 ${((1-cropRight)*100).toFixed(1)}% / ` +
+      `상 ${(cropTop*100).toFixed(1)}% / 하 ${((1-cropBottom)*100).toFixed(1)}%`
+    );
+  } else {
+    setStatus(`자르기 적용: 비율 ${cropRatio} · 스케일 ${(cropScale*100).toFixed(0)}%`);
+  }
 };
 
 // Wiring
