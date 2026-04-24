@@ -169,9 +169,11 @@
   <div id="list-panel">
     <div id="list-header">
       <span id="frame-count">프레임 0개</span>
-      <div style="display:flex; gap:4px;">
+      <div style="display:flex; gap:4px; flex-wrap:wrap;">
         <button id="btn-check-all" style="padding:2px 6px; font-size:11px;">모두 선택</button>
         <button id="btn-uncheck-all" style="padding:2px 6px; font-size:11px;">모두 해제</button>
+        <button id="btn-del-checked" style="padding:2px 6px; font-size:11px;" title="체크된 프레임 삭제">✕ 체크 삭제</button>
+        <button id="btn-del-unchecked" style="padding:2px 6px; font-size:11px;" title="체크 해제된 프레임 삭제">✕ 해제 삭제</button>
       </div>
     </div>
     <div id="frame-list" class="empty">
@@ -1059,6 +1061,24 @@ $('btn-uncheck-all').onclick = () => {
   frames.forEach(f => f.included = false);
   renderList();
 };
+
+function deleteFramesBy(predicate, label) {
+  if (!frames.length) return;
+  const toDelete = frames.filter(predicate);
+  if (!toDelete.length) { setStatus(`삭제할 ${label} 프레임이 없습니다`, 'error'); return; }
+  if (!confirm(`${label} 프레임 ${toDelete.length}개를 삭제할까요?`)) return;
+  const deletedIds = new Set(toDelete.map(f => f.id));
+  for (let i = frames.length - 1; i >= 0; i--) {
+    if (deletedIds.has(frames[i].id)) frames.splice(i, 1);
+  }
+  if (deletedIds.has(selectedId)) selectedId = null;
+  renderList();
+  if (frames.length) drawPreviewFrame(0);
+  else clearPreview();
+  setStatus(`프레임 ${toDelete.length}개 삭제됨 (남은 ${frames.length}개)`);
+}
+$('btn-del-checked').onclick = () => deleteFramesBy(f => f.included, '체크된');
+$('btn-del-unchecked').onclick = () => deleteFramesBy(f => !f.included, '체크 해제된');
 $('btn-clear').onclick = () => {
   if (!frames.length) return;
   if (!confirm('모든 프레임을 삭제할까요?')) return;
