@@ -77,6 +77,7 @@
   <div class="sep"></div>
   <button id="btn-select-all">전체 선택</button>
   <div class="spacer"></div>
+  <button id="btn-save-all" title="현재 이미지 선택 영역을 모든 이미지에 비율로 적용해 각각 저장">전체 저장 (같은 비율)</button>
   <button id="btn-save" class="primary">잘라서 저장</button>
 </header>
 
@@ -497,27 +498,65 @@ function zoomAtCenter(factor) {
   render();
 }
 
+function downloadCrop(entry, sx, sy, sw, sh) {
+  return new Promise((resolve) => {
+    const out = document.createElement('canvas');
+    out.width = sw; out.height = sh;
+    const octx = out.getContext('2d');
+    octx.imageSmoothingEnabled = false;
+    octx.drawImage(entry.source, sx, sy, sw, sh, 0, 0, sw, sh);
+    out.toBlob((blob) => {
+      if (!blob) { resolve(false); return; }
+      const base = entry.name.replace(/\.[^.]+$/, '');
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `${base}_cut.png`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      resolve(true);
+    }, 'image/png');
+  });
+}
+
 function saveCurrent() {
   const e = current();
   if (!e) { setStatus('저장할 이미지가 없습니다', 'error'); return; }
   const s = e.sel;
   if (s.w < 1 || s.h < 1) { setStatus('선택 영역이 너무 작습니다', 'error'); return; }
-  const out = document.createElement('canvas');
-  out.width = Math.round(s.w);
-  out.height = Math.round(s.h);
-  const octx = out.getContext('2d');
-  octx.imageSmoothingEnabled = false;
-  octx.drawImage(e.source, Math.round(s.x), Math.round(s.y), out.width, out.height, 0, 0, out.width, out.height);
-  out.toBlob((blob) => {
-    if (!blob) { setStatus('저장 실패', 'error'); return; }
-    const base = e.name.replace(/\.[^.]+$/, '');
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = `${base}_cut.png`;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    setStatus(`저장됨: ${base}_cut.png`);
-  }, 'image/png');
+  downloadCrop(e, Math.round(s.x), Math.round(s.y), Math.round(s.w), Math.round(s.h))
+    .then(ok => setStatus(ok ? `저장됨: ${e.name.replace(/\.[^.]+$/, '')}_cut.png` : '저장 실패', ok ? '' : 'error'));
+}
+
+async function saveAll() {
+  if (!images.length) { setStatus('이미지가 없습니다', 'error'); return; }
+  const cur = current();
+  if (!cur) { setStatus('기준 이미지가 없습니다', 'error'); return; }
+  const s = cur.sel;
+  if (s.w < 1 || s.h < 1) { setStatus('선택 영역이 너무 작습니다', 'error'); return; }
+  const src = cur.source;
+  const xPct = s.x / src.width;
+  const yPct = s.y / src.height;
+  const wPct = s.w / src.width;
+  const hPct = s.h / src.height;
+  if (!confirm(`${images.length}개 이미지를 같은 비율(${(wPct*100).toFixed(1)}% × ${(hPct*100).toFixed(1)}%)로 잘라서 각각 저장합니다.\n계속할까요?`)) return;
+  let ok = 0;
+  for (let i = 0; i < images.length; i++) {
+    const e = images[i];
+    const sw = e.source.width, sh = e.source.height;
+    let fx = Math.round(sw * xPct);
+    let fy = Math.round(sh * yPct);
+    let fw = Math.round(sw * wPct);
+    let fh = Math.round(sh * hPct);
+    fx = Math.max(0, Math.min(sw - 1, fx));
+    fy = Math.max(0, Math.min(sh - 1, fy));
+    fw = Math.max(1, Math.min(sw - fx, fw));
+    fh = Math.max(1, Math.min(sh - fy, fh));
+    setStatus(`저장 ${i+1}/${images.length}: ${e.name}`, 'busy');
+    const done = await downloadCrop(e, fx, fy, fw, fh);
+    if (done) ok++;
+    await new Promise(r => setTimeout(r, 150)); // avoid browser batch throttling
+  }
+  setStatus(`${ok}/${images.length}개 저장 완료`);
 }
 
 // --- Wiring ---
@@ -532,6 +571,7 @@ $('btn-zoom-out').onclick = () => zoomAtCenter(1 / 1.25);
 $('btn-fit').onclick = () => { fitToView(); render(); };
 $('btn-select-all').onclick = selectAll;
 $('btn-save').onclick = saveCurrent;
+$('btn-save-all').onclick = saveAll;
 
 // Drag and drop
 ['dragenter', 'dragover'].forEach(ev => {
